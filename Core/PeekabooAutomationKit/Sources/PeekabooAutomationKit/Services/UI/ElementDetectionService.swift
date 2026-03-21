@@ -150,7 +150,7 @@ extension ElementDetectionService {
         appIsActive: Bool,
         allowWebFocus: Bool,
         elementIdMap: inout [String: DetectedElement],
-        timeoutSeconds: Double = 20.0) async throws -> [DetectedElement]
+        timeoutSeconds: Double = 60.0) async throws -> [DetectedElement]
     {
         let detectionTask = Task { () -> ([DetectedElement], [String: DetectedElement]) in
             let deadline = Date().addingTimeInterval(timeoutSeconds)
