@@ -81,6 +81,38 @@ struct FocusUtilitiesTests {
     }
 
     @Test
+    func `already focused window should short circuit`() {
+        #expect(
+            shouldSkipFocusVerification(
+                appIsActive: true,
+                windowIsMain: true,
+                windowIsMinimized: false
+            ) == true
+        )
+        #expect(
+            shouldSkipFocusVerification(
+                appIsActive: false,
+                windowIsMain: true,
+                windowIsMinimized: false
+            ) == false
+        )
+        #expect(
+            shouldSkipFocusVerification(
+                appIsActive: true,
+                windowIsMain: false,
+                windowIsMinimized: false
+            ) == false
+        )
+        #expect(
+            shouldSkipFocusVerification(
+                appIsActive: true,
+                windowIsMain: true,
+                windowIsMinimized: true
+            ) == false
+        )
+    }
+
+    @Test
     @MainActor
     func `findBestWindow with non-existent app`() async throws {
         let service = FocusManagementService()
