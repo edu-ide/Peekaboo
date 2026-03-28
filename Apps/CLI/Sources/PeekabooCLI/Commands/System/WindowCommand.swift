@@ -497,17 +497,15 @@ extension WindowCommand {
                     throw PeekabooError.windowNotFound(criteria: "No windows found for \(appName)")
                 }
 
-                // Use enhanced focus with space support
-                if let windowID = windowInfo?.windowID {
-                    try await ensureFocused(
-                        windowID: CGWindowID(windowID),
-                        applicationName: appName,
-                        windowTitle: self.windowOptions.windowTitle,
-                        options: self.focusOptions.asFocusOptions,
-                        services: self.services
+                // Prefer direct window-service focus for explicit window focus commands.
+                // This avoids the heavier ensureFocused pipeline, which is better suited for
+                // "focus before another interaction" flows than for the dedicated window focus command.
+                if let info = windowInfo, !info.title.isEmpty {
+                    try await WindowServiceBridge.focusWindow(
+                        windows: self.services.windows,
+                        target: .applicationAndTitle(app: appName, title: info.title)
                     )
                 } else {
-                    // Fallback to regular focus if no window ID
                     try await WindowServiceBridge.focusWindow(windows: self.services.windows, target: target)
                 }
 

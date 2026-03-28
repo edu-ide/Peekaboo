@@ -64,6 +64,26 @@ public final class WindowManagementService: WindowManagementServiceProtocol {
     }
 }
 
+func selectFocusedWindowInfo(
+    _ windows: [ServiceWindowInfo],
+    focusedWindowID: Int?,
+    mainWindowID: Int?
+) -> ServiceWindowInfo? {
+    if let focusedWindowID,
+       let focused = windows.first(where: { $0.windowID == focusedWindowID })
+    {
+        return focused
+    }
+
+    if let mainWindowID,
+       let main = windows.first(where: { $0.windowID == mainWindowID })
+    {
+        return main
+    }
+
+    return windows.first(where: \.isMainWindow) ?? windows.first
+}
+
 @MainActor
 extension WindowManagementService {
     public func closeWindow(target: WindowTarget) async throws {
@@ -399,7 +419,21 @@ extension WindowManagementService {
     public func getFocusedWindow() async throws -> ServiceWindowInfo? {
         let frontmostApp = try await applicationService.getFrontmostApplication()
         let windows = try await self.windows(for: frontmostApp.name)
-        return windows.first
+        guard !windows.isEmpty else { return nil }
+
+        guard let runningApp = NSRunningApplication(processIdentifier: frontmostApp.processIdentifier) else {
+            return selectFocusedWindowInfo(windows, focusedWindowID: nil, mainWindowID: nil)
+        }
+
+        let axApp = AXApp(runningApp)
+        let focusedWindowID = axApp.focusedWindow().flatMap { self.windowIdentityService.getWindowID(from: $0) }.map(Int.init)
+        let mainWindowID = axApp.element.mainWindow().flatMap { self.windowIdentityService.getWindowID(from: $0) }.map(Int.init)
+
+        return selectFocusedWindowInfo(
+            windows,
+            focusedWindowID: focusedWindowID,
+            mainWindowID: mainWindowID
+        )
     }
 
     // MARK: - Private Helpers

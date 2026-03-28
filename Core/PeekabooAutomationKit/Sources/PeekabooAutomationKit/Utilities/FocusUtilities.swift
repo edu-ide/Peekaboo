@@ -91,13 +91,38 @@ public struct FocusOptions: FocusOptionsProtocol {
     }
 }
 
-@MainActor
 func shouldSkipFocusVerification(
     appIsActive: Bool,
     windowIsMain: Bool,
     windowIsMinimized: Bool
 ) -> Bool {
     appIsActive && windowIsMain && !windowIsMinimized
+}
+
+func shouldTreatWindowAsFocused(
+    targetWindowID: CGWindowID,
+    windowIsMain: Bool,
+    windowIsFocused: Bool,
+    windowIsMinimized: Bool,
+    appFocusedWindowID: CGWindowID?,
+    appMainWindowID: CGWindowID?
+) -> Bool {
+    if windowIsMinimized {
+        return false
+    }
+    if windowIsMain || windowIsFocused {
+        return true
+    }
+    return appFocusedWindowID == targetWindowID || appMainWindowID == targetWindowID
+}
+
+func focusClickPoint(for frame: CGRect) -> CGPoint {
+    let titleBarInset = min(max(frame.height * 0.03, 12), 24)
+    return CGPoint(x: frame.midX, y: frame.minY + titleBarInset)
+}
+
+func isTargetFrontmostInWindowOrder(_ orderedWindowIDs: [CGWindowID], targetWindowID: CGWindowID) -> Bool {
+    orderedWindowIDs.first == targetWindowID
 }
 
 // MARK: - Focus Command Extension
@@ -186,8 +211,14 @@ public final class FocusManagementService {
             try await self.handleSpaceFocus(windowID: windowID, bringToCurrentSpace: options.bringToCurrentSpace)
         }
 
+        let windowInfo = self.windowIdentityService.getWindowInfo(windowID: windowID)
+
         // Find the window handle (app + element)
         guard let handle = windowIdentityService.findWindow(byID: windowID) else {
+            if let windowInfo {
+                try await self.focusWindowWithoutAX(windowID: windowID, info: windowInfo, options: options)
+                return
+            }
             throw FocusError.axElementNotFound(windowID)
         }
 
@@ -203,7 +234,8 @@ public final class FocusManagementService {
 
         // Activate the application
         if !runningApp.isActive {
-            runningApp.activate()
+            _ = runningApp.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            _ = handle.app.element.activate()
 
             // Wait for activation
             try await self.waitForCondition(
@@ -213,7 +245,7 @@ public final class FocusManagementService {
         }
 
         // Focus the window
-        try await self.focusWindowElement(handle.element, windowID: windowID, options: options)
+        try await self.focusWindowElement(handle, windowID: windowID, options: options)
     }
 
     // MARK: - Private Helpers
@@ -232,33 +264,35 @@ public final class FocusManagementService {
     }
 
     private func focusWindowElement(
-        _ windowElement: Element,
+        _ handle: AXWindowHandle,
         windowID: CGWindowID,
         options: FocusOptions) async throws
     {
         var lastError: (any Error)?
 
         for attempt in 1...options.retryCount {
-            // Try to focus the window
-            // Try to raise the window
             do {
-                try windowElement.performAction(.raise)
+                try handle.element.performAction(.raise)
             } catch {
-                // If raise action fails, try to make it main
-                // Note: Setting main window through AX API requires finding parent app
-                // This is handled by the activate() call above
+                // Continue into attribute-based promotion below.
             }
 
-            // Verify focus
-            do {
-                try await self.verifyWindowFocus(windowElement, windowID: windowID, timeout: options.timeout)
+            self.promoteWindowToFocusedState(handle)
 
-                // Successfully focused window
+            do {
+                try await self.verifyWindowFocus(handle, windowID: windowID, timeout: options.timeout)
                 return
             } catch {
                 lastError = error
-                // Focus attempt failed: \(error.localizedDescription)
-
+                if attempt == 1 {
+                    self.lowLevelFocusFallback(handle)
+                    do {
+                        try await self.verifyWindowFocus(handle, windowID: windowID, timeout: min(0.5, options.timeout))
+                        return
+                    } catch {
+                        lastError = error
+                    }
+                }
                 if attempt < options.retryCount {
                     try await Task.sleep(nanoseconds: 500_000_000) // 0.5s between retries
                 }
@@ -268,30 +302,106 @@ public final class FocusManagementService {
         throw lastError ?? FocusError.focusVerificationFailed(windowID)
     }
 
+    private func focusWindowWithoutAX(
+        windowID: CGWindowID,
+        info: WindowIdentityInfo,
+        options: FocusOptions) async throws
+    {
+        guard let runningApp = NSRunningApplication(processIdentifier: info.ownerPID) else {
+            throw FocusError.applicationNotRunning(info.applicationName ?? "\(info.ownerPID)")
+        }
+
+        if !runningApp.isActive {
+            _ = runningApp.activate(options: [.activateAllWindows])
+            try await self.waitForCondition(
+                timeout: 2.0,
+                interval: 0.1,
+                condition: { runningApp.isActive })
+        }
+
+        let point = focusClickPoint(for: info.bounds)
+        try InputDriver.click(at: point)
+        try await self.verifyWindowFocusByWindowOrder(windowID: windowID, ownerPID: info.ownerPID, timeout: options.timeout)
+    }
+
     private func verifyWindowFocus(
-        _ windowElement: Element,
+        _ handle: AXWindowHandle,
         windowID: CGWindowID,
         timeout: TimeInterval) async throws
     {
         let startTime = Date()
 
         while Date().timeIntervalSince(startTime) < timeout {
-            // Check if window is main/focused
-            // We check the main attribute directly
-            if let isMain = windowElement.isMain(), isMain {
-                // Also verify it's not minimized
-                if let isMinimized = windowElement.isMinimized(),
-                   !isMinimized
-                {
-                    return // Success
-                }
+            let windowIsMain = handle.element.isMain() ?? false
+            let windowIsFocused = handle.element.isFocused() ?? false
+            let windowIsMinimized = handle.element.isMinimized() ?? false
+            let appFocusedWindowID = handle.app.focusedWindow().flatMap { self.windowIdentityService.getWindowID(from: $0) }
+            let appMainWindowID = handle.app.element.mainWindow().flatMap { self.windowIdentityService.getWindowID(from: $0) }
+
+            if shouldTreatWindowAsFocused(
+                targetWindowID: windowID,
+                windowIsMain: windowIsMain,
+                windowIsFocused: windowIsFocused,
+                windowIsMinimized: windowIsMinimized,
+                appFocusedWindowID: appFocusedWindowID,
+                appMainWindowID: appMainWindowID
+            ) {
+                return
             }
 
-            // Wait before next check
             try await Task.sleep(nanoseconds: 100_000_000) // 0.1s
         }
 
         throw FocusError.focusVerificationTimeout(windowID)
+    }
+
+    private func verifyWindowFocusByWindowOrder(
+        windowID: CGWindowID,
+        ownerPID: pid_t,
+        timeout: TimeInterval) async throws
+    {
+        let startTime = Date()
+        while Date().timeIntervalSince(startTime) < timeout {
+            let orderedWindowIDs = self.frontmostWindowIDs(ownerPID: ownerPID)
+            if isTargetFrontmostInWindowOrder(orderedWindowIDs, targetWindowID: windowID) {
+                return
+            }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        throw FocusError.focusVerificationTimeout(windowID)
+    }
+
+    private func promoteWindowToFocusedState(_ handle: AXWindowHandle) {
+        _ = handle.element.setValue(true, forAttribute: AXAttributeNames.kAXMainAttribute)
+        if handle.element.isAttributeSettable(named: AXAttributeNames.kAXFocusedAttribute) {
+            _ = handle.element.setValue(true, forAttribute: AXAttributeNames.kAXFocusedAttribute)
+        }
+
+        let appElement = handle.app.element
+        if appElement.isAttributeSettable(named: AXAttributeNames.kAXFocusedWindowAttribute) {
+            _ = appElement.setValue(handle.element, forAttribute: AXAttributeNames.kAXFocusedWindowAttribute)
+        }
+        if appElement.isAttributeSettable(named: AXAttributeNames.kAXMainWindowAttribute) {
+            _ = appElement.setValue(handle.element, forAttribute: AXAttributeNames.kAXMainWindowAttribute)
+        }
+    }
+
+    private func lowLevelFocusFallback(_ handle: AXWindowHandle) {
+        guard let frame = handle.frame else { return }
+        let point = focusClickPoint(for: frame)
+        try? InputDriver.click(at: point)
+    }
+
+    private func frontmostWindowIDs(ownerPID: pid_t) -> [CGWindowID] {
+        let infos = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return infos.compactMap { info in
+            guard let pid = info[kCGWindowOwnerPID as String] as? pid_t, pid == ownerPID,
+                  let id = info[kCGWindowNumber as String] as? Int
+            else {
+                return nil
+            }
+            return CGWindowID(id)
+        }
     }
 
     private func prioritizeWindows(_ windows: [WindowIdentityInfo]) -> [WindowIdentityInfo] {
