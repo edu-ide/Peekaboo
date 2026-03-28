@@ -488,10 +488,7 @@ extension WindowCommand {
                 let appName = appInfo.name
 
                 // Get window info before action
-                let windows = try await WindowServiceBridge.listWindows(
-                    windows: self.services.windows,
-                    target: self.windowOptions.toWindowTarget()
-                )
+                let windows = try await self.listCandidateWindows(appInfo: appInfo)
                 self.logger.debug("Found \(windows.count) windows")
                 let windowInfo = self.windowOptions.selectWindow(from: windows)
 
@@ -514,11 +511,7 @@ extension WindowCommand {
                     try await WindowServiceBridge.focusWindow(windows: self.services.windows, target: target)
                 }
 
-                let refreshedWindowInfo = await self.windowOptions.refetchWindowInfo(
-                    services: self.services,
-                    logger: self.logger,
-                    context: "window-focus"
-                )
+                let refreshedWindowInfo = await self.refetchFocusedWindowInfo(appInfo: appInfo)
                 let finalWindowInfo = refreshedWindowInfo ?? windowInfo
 
                 if self.verify {
@@ -553,6 +546,35 @@ extension WindowCommand {
                 handleError(error)
                 throw ExitCode(1)
             }
+        }
+
+        private func listCandidateWindows(appInfo: ServiceApplicationInfo) async throws -> [ServiceWindowInfo] {
+            if let windowId = self.windowOptions.windowId {
+                let output = try await self.services.applications.listWindows(for: appInfo.name, timeout: 0.5)
+                let matched = output.data.windows.filter { $0.windowID == windowId }
+                if !matched.isEmpty {
+                    return matched
+                }
+            }
+
+            return try await WindowServiceBridge.listWindows(
+                windows: self.services.windows,
+                target: self.windowOptions.toWindowTarget()
+            )
+        }
+
+        private func refetchFocusedWindowInfo(appInfo: ServiceApplicationInfo) async -> ServiceWindowInfo? {
+            if let windowId = self.windowOptions.windowId,
+               let output = try? await self.services.applications.listWindows(for: appInfo.name, timeout: 0.5)
+            {
+                return output.data.windows.first(where: { $0.windowID == windowId })
+            }
+
+            return await self.windowOptions.refetchWindowInfo(
+                services: self.services,
+                logger: self.logger,
+                context: "window-focus"
+            )
         }
 
         private func verifyFocus(

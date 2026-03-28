@@ -91,6 +91,15 @@ public struct FocusOptions: FocusOptionsProtocol {
     }
 }
 
+@MainActor
+func shouldSkipFocusVerification(
+    appIsActive: Bool,
+    windowIsMain: Bool,
+    windowIsMinimized: Bool
+) -> Bool {
+    appIsActive && windowIsMain && !windowIsMinimized
+}
+
 // MARK: - Focus Command Extension
 
 // MARK: - Focus Management Service
@@ -183,6 +192,14 @@ public final class FocusManagementService {
         }
 
         let runningApp = handle.app.application
+
+        if shouldSkipFocusVerification(
+            appIsActive: runningApp.isActive,
+            windowIsMain: handle.element.isMain() ?? false,
+            windowIsMinimized: handle.element.isMinimized() ?? false
+        ) {
+            return
+        }
 
         // Activate the application
         if !runningApp.isActive {
